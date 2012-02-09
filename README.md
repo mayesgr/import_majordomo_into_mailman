@@ -1,11 +1,10 @@
 Import Majordomo into Mailman
-
 =============================
 
 Create Mailman list(s) from Majordomo list configuration files.
 
 Features
-========
+--------
 
 * Import a single list (--list=NAME)
 * Import all lists (--all)
@@ -16,7 +15,7 @@ Features
 
 
 Requirements
-============
+------------
 
 * Mailman is installed so that its bin/* scripts can be called.
 * Majordomo has all of its list configurations in a single, local directory.
@@ -27,7 +26,7 @@ command is stored locally.
 
 
 Before running this script
-==========================
+--------------------------
 
 * Change the global variables under "Environment-specific values" to match your
 system.
@@ -38,7 +37,7 @@ fields that don't get imported (e.g. message_headers) that have many
 
 
 Testing
-=======
+-------
 
 This script was tested against Majordomo 1.94.4/5 and Mailman 2.1.14-1.
 Different versions of Majordomo or Mailman may not work with this script.
@@ -46,7 +45,7 @@ However, some legacy settings for Majordomo are handled.
 
 
 Limitations
-===========
+-----------
 
 * Archives are not currently handled.
 * A few Majordomo configuration values are ignored (documented in the comment
@@ -55,6 +54,6 @@ system/constant settings, or don't tranlsate into Mailman.
 
 
 Todo
-====
+----
 
 * Add an --archives option to also import archives.
