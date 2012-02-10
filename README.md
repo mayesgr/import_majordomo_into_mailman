@@ -10,7 +10,8 @@ Features
 * Import all lists (--all)
 * Import subscribers (--subscribers)
 * Just generate information about all Majordomo lists (--stats)
-* Modify the console log level (--log-level=[debug|info|notice|warning])
+* Verbose logging to file
+* Control over the console log level (--log-level=[debug|info|notice|warning])
 * Only import lists that have been active within the past N days
 
 
