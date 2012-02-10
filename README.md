@@ -20,15 +20,15 @@ Requirements
 * Mailman is installed so that its bin/* scripts can be called.
 * Majordomo has all of its list configurations in a single, local directory.
 * Majordomo's aliases file exists locally.
-* $LIST_AGE_LIMIT set to zero or the output of Majordomo's consistency_check
-command is stored locally.
+* $DOMO_INACTIVITY_LIMIT set to zero or the file path of the output of
+Majordomo's consistency_check command.
 * Run as root.
 
 
 Before running this script
 --------------------------
 
-* Change the global variables under "Environment-specific values" to match your
+* Change the global variables under "ENVIRONMENT-SPECIFIC VALUES" to match your
 system.
 * It is recommended to run this script with the --stats option first to get
 a sense of your data. Fields with many 'other' or 'no value' values, or
