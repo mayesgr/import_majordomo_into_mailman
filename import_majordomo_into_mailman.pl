@@ -760,7 +760,8 @@ sub createMailmanList {
    # Any additional owners will be added when configureMailmanList() is called.
    $ownerEmail = (split /,/, $ownerEmail)[0];
    $ownerEmail =~ s/['"\[\]]//g;
-   my $cmd = "$MM_NEWLIST -l en -q $listName $ownerEmail '$listPassword'";
+   my $cmd = "$MM_NEWLIST -l $LANGUAGE -q $listName $ownerEmail " .
+             "'$listPassword'";
    $log->debug("Calling $cmd...");
    system($cmd) == 0 or $log->die("Command failed: $!");
 }
