@@ -41,24 +41,28 @@ use warnings;
 
 use Getopt::Long;
 use Log::Handler;
-use File::Temp qw/tempfile/;
-use Data::Dump qw/dump/;
+use File::Temp qw(tempfile);
+use Email::Simple;
+use Email::Sender::Simple qw(try_to_sendmail);
+use Data::Dump qw(dump);
 
 
 #----------------------- ENVIRONMENT-SPECIFIC VALUES --------------------------#
-my $DOMO_PATH              = '/var/majordomo';
+my $DOMO_PATH              = '/opt/majordomo';
 my $DOMO_LIST_DIR          = "$DOMO_PATH/lists";
 my $MM_PATH                = '/usr/local/mailman';
-my $DOMO_ALIASES           = "$DOMO_PATH/aliases";
-my $DOMO_CONSISTENCY_CHECK = "$DOMO_PATH/consistency_check.txt"; # Optional
+my $DOMO_ALIASES           = "$MM_PATH/majordomo/aliases";
+my $DOMO_CHECK_CONSISTENCY = "$MM_PATH/majordomo/check_consistency.txt";
+my $BOUNCED_OWNERS         = "/opt/mailman-2.1.14-1/uo/majordomo/" .
+                             "email_addresses_that_bounced.txt";
 my $TMP_DIR                = '/tmp';
 # Only import lists that have been active in the last N days.
-my $DOMO_INACTIVITY_LIMIT  = 0;   # Optional
+my $DOMO_INACTIVITY_LIMIT  = 548;   # Optional.  548 days = 18 months.
 # If set, overwrite Majordomo's "resend_host" and thus Mailman's "host_name".
 my $NEW_HOSTNAME           = '';  # Optional
 my $LANGUAGE               = 'en';  # Preferred language for all Mailman lists
-my $MAX_MSG_SIZE           = 1000;  # In KB. Used for the Mailman config.
-#-----------------------------------------------------------------------------#
+my $MAX_MSG_SIZE           = 20000;  # In KB. Used for the Mailman config.
+#------------------------------------------------------------------------------#
 
 #
 # Global constants
@@ -69,14 +73,19 @@ my $MM_NEWLIST     = "$MM_PATH/bin/newlist";
 my $MM_CONFIGLIST  = "$MM_PATH/bin/config_list";
 my $MM_ADDMEMBERS  = "$MM_PATH/bin/add_members";
 my $MM_CHECK_PERMS = "$MM_PATH/bin/check_perms";
-my $SCRIPT_NAME    = $0 =~ /\/?(\b\w+\b)\.pl$/ ? $1 : 'unknown_script_name';
+my $SCRIPT_NAME    = $0 =~ /\/?(\b\w+\b)\.pl$/ ? $1 : '<script name>';
 my $LOG_FILE       = "$TMP_DIR/$SCRIPT_NAME.log";
 
 #
 # Global namespace
 #
 my $log = Log::Handler->new();
-my $domoStats = {};
+my $domoStats = {
+   'general_stats' => {
+      'Lists without owner in aliases' => 0,
+      'Total lists' => 0
+    }
+};
 
 
 #
@@ -98,40 +107,60 @@ sub main {
    # Get lists to import.
    my @domoListNames = getDomoListsToImport($opts);
    # Get a mapping of list names to list owners.
-   my $listToOwnerMapRef = getListToOwnerMapRef();
+   my $listOwnerMap = getListToOwnerMap();
    # Get lists that already exist in Mailman.
    my %existingLists = getExistingLists();
    # Get all lists that have been inactive longer than the specified limit.
-   my %listsOverInactivityLimit = getListsOverInactivityLimit();
+   my $inactiveLists = getInactiveLists();
 
-   # Loop through the config files and load each list's configuration.
+   if ($opts->{'email_notify'}) {
+      # Email Majordomo list owners about the upcoming migration to Mailman.
+      sendCustomEmailsToDomoOwners($listOwnerMap, $inactiveLists, 1);
+      exit;
+   }
+
+   if ($opts->{'email_test'}) {
+      # Email Majordomo list owners about the upcoming migration to Mailman.
+      sendCustomEmailsToDomoOwners($listOwnerMap, $inactiveLists);
+      exit;
+   }
+
+   # Iterate through every list, collecting stats, and possibly importing.
    for my $listName (@domoListNames) {
       $log->info("Starting list $listName...");
 
+      if (not exists $listOwnerMap->{$listName}) {
+         $log->warning("List $listName has no owner in aliases. Skipping...");
+         $domoStats->{'general_stats'}->{'Lists without owner in aliases'} += 1;
+         next;
+      }
+
+      # Don't import lists that are pending deletion. This is a University of
+      # Oregon customization, but it should be harmless for others.
+      if (-e "$DOMO_LIST_DIR/$listName.pendel") {
+         $log->info("List $listName has a .pendel file. Skipping...");
+         $domoStats->{'general_stats'}->{'Lists pending deletion'} += 1;
+         next;
+      }
+
       # Don't import the list if it's been inactive beyond the specified limit.
-      if (exists $listsOverInactivityLimit{$listName}) {
+      if (exists $inactiveLists->{$listName}) {
          $log->notice("List $listName has been inactive for " .
-                      "$listsOverInactivityLimit{$listName} days. Skipping...");
+                      "$inactiveLists->{$listName} days. Skipping...");
+         $domoStats->{'general_stats'}->{'Lists inactive for more than ' .
+                                         "$DOMO_INACTIVITY_LIMIT days"} += 1;
          next;
       }
 
-      # Don't import this list if it's a Majordomo digest list. Mailman doesn't
-      # have a separate list just for digests.
-      if ($listName =~ /\-(digest|archive)$/) {
-         $log->info(ucfirst($1) . "s ($listName) are not separate lists in " .
-                    "Mailman. Skipping...");
-         next;
-      }
-
-      # Load the Majordomo configuration.
+      # Get the Majordomo configuration.
       $log->info("Getting Majordomo config for list $listName...");
-      my %domoConfig = getDomoConfig($listName, $listToOwnerMapRef);
+      my %domoConfig = getDomoConfig($listName, $listOwnerMap);
       if (not %domoConfig) {
          $log->debug("No config returned by getDomoConfig(). Skipping...");
          next;
       }
 
-      # Add this list to the stats data structure and skip if --stats.
+      # Add this list to the stats data structure and then skip if --stats.
       $log->debug("Appending this list's data into the stats structure...");
       appendDomoStats(%domoConfig);
       if ($opts->{'stats'}) {
@@ -147,12 +176,13 @@ sub main {
       # Get a hash of Mailman config values mapped from Majordomo.
       my %mmConfig = getMailmanConfig(%domoConfig);
 
-      # Create the text/template configuration file for this list.
+      # Create the template configuration file for this list.
       my $mmConfigFilePath =
          createMailmanConfigFile($domoConfig{'approve_passwd'}, %mmConfig);
 
-      # Create the MM list.
-      createMailmanList($listName, $mmConfig{'owner'},
+      # Create the Mailman list.
+      createMailmanList($listName,
+                        $mmConfig{'owner'},
                         $domoConfig{'admin_passwd'});
 
       # Apply the configuration template to the list.
@@ -169,7 +199,8 @@ sub main {
 
          # Subscribe the member emails to the Mailman list.
          if ($membersFilePath or $digestMembersFilePath) {
-            addMembersToMailmanList($listName, $membersFilePath,
+            addMembersToMailmanList($listName,
+                                    $membersFilePath,
                                     $digestMembersFilePath);
          }
       }
@@ -186,53 +217,57 @@ sub main {
    print "Complete log: $LOG_FILE\n";
 }
 
-# Environment/sanity/etc checks before modifying state
+# Environment/system/setting checks before modifying state
 sub preImportChecks {
-   # Root is required because of various system calls (e.g. bin/check_perms -f).
-   if ($>) {
-      exit("Error: Please run this script as root.");
+   # User "mailman" is required because of various calls to the mailman/bin/*
+   # scripts.
+   my $script_executor = $ENV{LOGNAME} || $ENV{USER} || getpwuid($<);
+   if ($script_executor !~ /^(mailman|root)$/) {
+      die "Error: Please run this script as user mailman (or root).\n";
    }
    # Check that the Majordomo and Mailman list directories exist.
    for my $dir ($DOMO_LIST_DIR, $MM_LIST_DIR) {
       if (not $dir or not -d $dir) {
-         exit("Error: Lists directory does not exist: $dir");
+         die "Error: Lists directory does not exist: $dir\n";
       }
    }
    # Check that the Mailman binaries exist.
    for my $bin ($MM_LIST_LISTS, $MM_NEWLIST, $MM_CONFIGLIST, $MM_ADDMEMBERS) {
       if (not $bin or not -e $bin) {
-         exit("Error: Mailman binary doesn't exist: $bin");
+         die "Error: Mailman binary doesn't exist: $bin\n";
       }
    }
-   # Check the path of $DOMO_CONSISTENCY_CHECK.
-   if ($DOMO_CONSISTENCY_CHECK and not -e $DOMO_CONSISTENCY_CHECK) {
-      exit("Error: \$DOMO_CONSISTENCY_CHECK does not exist: " .
-          "$DOMO_CONSISTENCY_CHECK\nCorrect the value or set it to ''.");
+   # Check the path of $DOMO_CHECK_CONSISTENCY.
+   if ($DOMO_CHECK_CONSISTENCY and not -e $DOMO_CHECK_CONSISTENCY) {
+      die "Error: \$DOMO_CHECK_CONSISTENCY does not exist: " .
+          "$DOMO_CHECK_CONSISTENCY\nCorrect the value or set it to ''.\n";
    }
-   # If $DOMO_CONSISTENCY_CHECK exists, then so must $DOMO_ACTIVITY_LIMIT.
-   if ($DOMO_CONSISTENCY_CHECK and not $DOMO_INACTIVITY_LIMIT) {
-      exit("Error: \$DOMO_CONSISTENCY_CHECK exists but " .
-          "\$DOMO_INACTIVITY_LIMIT does not.\nPlease set this value.");
+   # If $DOMO_CHECK_CONSISTENCY exists, then so must $DOMO_ACTIVITY_LIMIT.
+   if ($DOMO_CHECK_CONSISTENCY and not $DOMO_INACTIVITY_LIMIT) {
+      die "Error: \$DOMO_CHECK_CONSISTENCY exists but " .
+          "\$DOMO_INACTIVITY_LIMIT does not.\nPlease set this value.\n";
    }
    # $LANGUAGE must be present and should only contain a-z.
    if (not $LANGUAGE or $LANGUAGE !~ /[a-z]+/i) {
-      exit("Error: \$LANGUAGE was not set or invalid: $LANGUAGE");
+      die "Error: \$LANGUAGE was not set or invalid: $LANGUAGE\n";
    }
    # $MAX_MSG_SIZE must be present and should really be above a minimum size.
    if (not $MAX_MSG_SIZE or $MAX_MSG_SIZE < 5) {
-      exit("Error: \$MAX_MSG_SIZE was not set or less than 5KB: $MAX_MSG_SIZE");
+      die "Error: \$MAX_MSG_SIZE was not set or less than 5KB: $MAX_MSG_SIZE\n";
    }
 }
 
 # Get CLI options.
 sub getCLIOpts {
    my $opts = {};
-   GetOptions('list=s'      => \$opts->{'list'},
-              'all'         => \$opts->{'all'},
-              'subscribers' => \$opts->{'subscribers'},
-              'loglevel=s'  => \$opts->{'loglevel'},
-              'stats'       => \$opts->{'stats'},
-              'help'        => \$opts->{'help'},
+   GetOptions('list=s'       => \$opts->{'list'},
+              'all'          => \$opts->{'all'},
+              'subscribers'  => \$opts->{'subscribers'},
+              'stats'        => \$opts->{'stats'},
+              'email-notify' => \$opts->{'email_notify'},
+              'email-test'   => \$opts->{'email_test'},
+              'loglevel=s'   => \$opts->{'loglevel'},
+              'help'         => \$opts->{'help'},
    );
 
    if ($opts->{'help'}) {
@@ -240,7 +275,8 @@ sub getCLIOpts {
    }
 
    # If --all or --list was not specified, get stats for all lists.
-   if ($opts->{'stats'} and not ($opts->{'all'} or $opts->{'list'})) {
+   if (($opts->{'stats'} or $opts->{'email_notify'} or $opts->{'email_test'})
+       and not ($opts->{'all'} or $opts->{'list'})) {
       $opts->{'all'} = 1;
    }
 
@@ -262,17 +298,18 @@ sub addLogHandler {
    $log->add(file   => { filename => $LOG_FILE,
                          #mode     => 'trunc',
                          maxlevel => 'debug',
-                         minlevel => 'info' },
+                         minlevel => 'emerg' },
              screen => { log_to   => 'STDOUT',
                          maxlevel => $opts->{'loglevel'},
-                         minlevel => 'error' }
+                         minlevel => 'emerg' }
    );
 }
 
-# Get the paths to the Majordomo config files that we will be importing.
+# Return an array of all list names in Majordomo that have a <list>.config file.
 sub getDomoListsToImport {
    my $opts = shift;
    my @domoListNames = ();
+   # If only one list was specified, validate and return that list.
    if ($opts->{'list'}) {
       my $listConfig = $opts->{'list'} . '.config';
       my $listPath = "$DOMO_LIST_DIR/$listConfig";
@@ -280,15 +317,21 @@ sub getDomoListsToImport {
          $log->die(crit => "Majordomo list config does not exist: $listPath");
       }
       @domoListNames = ($opts->{'list'});
+   # If all lists were requested, grab all list names from .config files in the
+   # $DOMO_LIST_DIR, ignoring digest lists (i.e. *-digest.config files).
    } elsif ($opts->{'all'}) {
       $log->info("Collecting all Majordomo list config files...");
       opendir DIR, $DOMO_LIST_DIR or
          $log->die("Can't open dir $DOMO_LIST_DIR: $!");
-      @domoListNames = map { /^([a-zA-Z0-9_\-]+)\.config$/ } readdir DIR;
+      # Don't get digest lists because these are not separate lists in Mailman.
+      @domoListNames = grep !/\-digest$/,
+                       map { /^([a-zA-Z0-9_\-]+)\.config$/ }
+                       readdir DIR;
       closedir DIR;
       if (not @domoListNames) {
          $log->die(crit => "No Majordomo configs found in $DOMO_LIST_DIR");
       }
+   # If we're here, --list or --all was not used, so exit.
    } else {
       $log->error("--list=NAME or --all was not used. Nothing to do.");
       help();
@@ -297,19 +340,23 @@ sub getDomoListsToImport {
 }
 
 # Find all list owners from aliases and create a map of lists to aliases.
-sub getListToOwnerMapRef {
-   my %listToOwnerMap = ();
+sub getListToOwnerMap {
+   my %listOwnerMap = ();
    open ALIASES, $DOMO_ALIASES or $log->die("Can't open $DOMO_ALIASES: $!");
    while (my $line = <ALIASES>) {
-      if ($line =~ /^owner\-([^:]+):\s*(.*\@.*)$/) {
-         my ($listName, $listOwner) = (strip($1), strip($2));
-         $listToOwnerMap{$listName} =
-            "'" . (join "', '", split /,/, $listOwner) . "'";
+      if ($line =~ /^owner\-([^:]+):\s*(.*)$/) {
+         my ($listName, $listOwners) = (strip($1), strip($2));
+         # Some lists in Majordomo's aliases file have the same email listed
+         # twice as the list owner (e.g. womenlaw).
+         # Converting the listed owners into a hash prevents duplicates.
+         my %ownersHash = map { $_ => 1 } split /,/, $listOwners;
+         $listOwnerMap{$listName} =
+            "'" . (join "', '", keys %ownersHash) . "'";
       }
    }
    close ALIASES or $log->die("Can't close $DOMO_ALIASES: $!");
 
-   return \%listToOwnerMap;
+   return \%listOwnerMap;
 }
 
 # Return a hash of all lists that already exist in Mailman.
@@ -322,21 +369,309 @@ sub getExistingLists {
 
 # By parsing the output of Majordomo's "consistency_check" command, get a list
 # of all Majordomo lists inactive beyond the specified $DOMO_INACTIVITY_LIMIT.
-sub getListsOverInactivityLimit {
+sub getInactiveLists {
    my %lists = ();
-   if ($DOMO_CONSISTENCY_CHECK) {
-      for my $line (split /\n/, getFileTxt($DOMO_CONSISTENCY_CHECK)) {
+   if ($DOMO_CHECK_CONSISTENCY) {
+      for my $line (split /\n/, getFileTxt($DOMO_CHECK_CONSISTENCY)) {
            
          if ($line =~ /(\S+) has been inactive for (\d+) days/) {
-            if ($2 > $DOMO_INACTIVITY_LIMIT) {
+            if ($2 >= $DOMO_INACTIVITY_LIMIT) {
                $lists{$1} = $2;
             }
          }
       }
    }
 
-   return %lists;
+   return \%lists;
 }
+
+sub getBouncedOwners {
+   my @bouncedOwners = ();
+   for my $line (split /\n/, getFileTxt($BOUNCED_OWNERS)) {
+      if ($line =~ /Failed to send mail to (\S+)\./) {
+         push @bouncedOwners, $1;
+      }
+   }
+
+   return @bouncedOwners;
+}
+
+sub getOwnerListMap {
+   my ($listOwnerMap, $inactiveLists) = @_;
+   my $ownerListMap = {};
+
+   for my $list (keys %$listOwnerMap) {
+      for my $owner (split /,/, $listOwnerMap->{$list}) {
+         my $type = exists $inactiveLists->{$list} ? 'inactive' : 'active';
+         my $owner = strip($owner, { full => 1 });
+         push @{$ownerListMap->{$owner}->{$type}}, $list;
+      }
+   }
+
+   return $ownerListMap;
+}
+
+# Send an individualized email to each Majordomo list owner that details
+# the upcoming migration procedure and their active and inactive lists.
+sub sendCustomEmailsToDomoOwners {
+   my ($listOwnerMap, $inactiveLists, $notify) = @_;
+   $notify = 0 if not defined $notify;
+
+   print "Send email to all Majordomo list owners?\n";
+   my $answer = '';
+   while ($answer !~ /^(yes|no)$/) {
+      print "Please type 'yes' or 'no':  ";
+      $answer = <>;
+      chomp $answer;
+   }
+
+   if ($answer ne "yes") {
+      print "No emails were sent.\n";
+      return;
+   }
+
+   # Create the body of the email for each owner
+   my $ownerListMap = getOwnerListMap($listOwnerMap, $inactiveLists);
+   for my $owner (keys %$ownerListMap) {
+      my $body = $notify ? getEmailNotifyText('top') : getEmailTestText('top');
+
+      # Append the active and inactive lists section to the email body
+      my $listsTxt = '';
+      for my $listType (qw(active inactive)) {
+         if ($ownerListMap->{$owner}->{$listType} and
+             @{$ownerListMap->{$owner}->{$listType}}) {
+            $listsTxt .= $notify ?
+                         getEmailNotifyText($listType,
+                            $ownerListMap->{$owner}->{$listType},
+                            $inactiveLists) :
+                         getEmailTestText($listType,
+                            $ownerListMap->{$owner}->{$listType},
+                            $inactiveLists);
+         }
+      }
+
+      if (not $listsTxt) {
+         $log->warning("No active or inactive lists found for owner $owner");
+         next;
+      }
+
+      $body .= $listsTxt;
+      $body .= $notify ? getEmailNotifyText('bottom') :
+                         getEmailTestText('bottom');
+
+      # Create and send the email.
+      my $email = Email::Simple->create(
+         header => [ 'From'     => 'listmaster@lists-test.uoregon.edu',
+                     'To'       => $owner,
+                     'Reply-To' => 'listmaster@lists.uoregon.edu',
+                     'Subject'  => 'Mailman (Majordomo replacement) ready ' .
+                                   'for testing' ],
+         body   => $body,
+      );
+      $log->debug("Sending notification email to $owner...");
+      my $result = try_to_sendmail($email);
+      if (not defined $result) {
+         $log->notice("Failed to send mail to $owner.");
+      }
+   }
+}
+
+# Return various sections, as requested, of a notification email for
+# current Majordomo list owners.
+sub getEmailNotifyText {
+   my ($section, $lists, $inactiveLists) = @_;
+
+   if ($section eq 'top') {
+      return <<EOF;
+Greetings;
+
+You are receiving this email because you have been identified as the owner
+of one or more Majordomo lists. We're in the process of informing all
+current Majordomo list owners of an impending change in the list
+processing software used by the University.
+
+Majordomo, the current list processing software in use by the University,
+hasn't been updated by its developers since January of 2000. The versions
+of the underlying software as well as the operating system required by
+Majordomo are no longer supported or maintained. As a result, we are
+implementing a new list processing software for the UO campus.
+
+Mailman (http://www.gnu.org/software/mailman/index.html) has been
+identified as a robust replacement for Majordomo. Mailman has a Web-based
+interface as well as a set of commands issued through email. There is a
+wide array of configuration options for the individual lists. Connections
+to the Mailman services through the Web are secured with SSL, and
+authentication into the server will be secured with LDAP, tied to the
+DuckID information.
+
+Information Services is currently in the process of configuring the
+Mailman server and testing the list operations. Our plan is to have the
+service ready for use very soon, with existing lists showing activity
+within the last 18 months being migrated seamlessly onto the new service.
+
+EOF
+   } elsif ($section eq 'active') {
+      my $listTxt = join "\n", sort @$lists;
+      return <<EOF;
+Our records indicate that you are the owner of the following lists:
+
+$listTxt
+
+These lists have had activity in the last 18 months, indicating that they
+may still be active. Unless you contact us, these active lists will be
+automatically migrated to Mailman.
+
+If you no longer want to keep any of the lists shown above, please send
+email to email indicating the name(s) of the list, and
+that you'd like the list(s) ignored during our migration procedure. You
+could also go to the Web page http://lists.uoregon.edu/delap.html and delete the
+list prior to the migration.
+
+EOF
+   } elsif ($section eq 'inactive') {
+      my $listTxt = join "\n",
+                    map { my $years = int($inactiveLists->{$_} / 365);
+                          $years = $years == 1 ? "$years year" : "$years years";
+                          my $days = $inactiveLists->{$_} % 365;
+                          $days = $days == 1 ? "$days day" : "$days days";
+                          "$_ (inactive $years, $days)" } sort @$lists;
+      return <<EOF;
+The following lists, for which you are the owner, have had no activity in
+the last 18 months:
+
+$listTxt
+
+Lists with no activity within the last 18 months will not be migrated, and
+will be unavailable after the migration to Mailman.
+
+If you want to retain one of the lists detailed above, you can either send
+a message to the list (which will update its activity), or send an email
+to email with an explanation as to why this
+inactive list should be migrated and maintained.
+
+EOF
+   } elsif ($section eq 'bottom') {
+      return <<EOF;
+There should be only brief interruptions in service during the migration.
+The change to Mailman will be scheduled to take place during the standard
+Tuesday maintenance period between 5am and 7am. If your list has been
+migrated to Mailman, you and your subscribers will be able to send posts
+to your list with the same address, and those messages will be distributed
+in the same way that Majordomo would.
+
+Documentation on using Mailman is in development, and will be available to
+facilitate the list migration. We will be making a test environment
+available to the list owners prior to the migration to the production
+Mailman server, so that you can see the settings for your lists and become
+accustomed to the new Web interface.
+
+If you have any questions or concerns, please contact email,
+or email me directly at email.
+   }
+
+   return '';
+}
+
+sub getEmailTestText {
+   my ($section, $lists, $inactiveLists) = @_;
+
+   if ($section eq 'top') {
+      return <<EOF;
+Greetings;
+
+Information Services is in the process of configuring Mailman as the UO list
+processing software, replacing Majordomo. You're receiving this email because
+you have been identified as the owner of one or more lists, either active or
+inactive.
+
+The final migration from Majordomo to Mailman is scheduled to take place on
+April 27th, 2012. At that time, your active lists will be migrated to the new
+service, and lists.uoregon.edu will begin using Mailman instead of Majordomo
+for its list processing. This move should be seamless with no downtime.
+
+We have set up a test server and would greatly appreciate your feedback.
+Specifically, we'd like to know:
+- how well the Majordomo settings for your lists were translated into Mailman
+- whether Mailman works as you'd expect and, if not, what didn't work
+- any other thoughts, concerns, responses, etc you have
+
+The test server is at https://domain. You will encounter a
+browser warning about an "unsigned certificate".  This is expected: please
+add an exception for the site.  Once Mailman goes live, however, there will
+be a signed certificate in place and this issue will not exist.
+
+All of your Majordomo list settings were migrated onto the Mailman test server
+except for subscribers.  We did not import subscribers so that you could test
+the email functionality of Mailman for your list.  To do so, subscribe your
+email address to your list, and perhaps a few other people who might be
+interested in testing Mailman (fellow moderators?), and send off a few emails.
+
+The links to your specific Mailman lists are listed below.  Please feel free
+to change anything you want: it is a test server, after all, and we'd love
+for you to thoroughly test Mailman.  Anything you change, however, will not
+show up on the production server when it goes live.  The production server
+will create your Majordomo lists in Mailman based on the Majordomo settings
+for your list on April 27, 2012.
+
+The password for these lists will be the same as the adminstrative password
+used on the Majordomo list. If you forgot that password, email
+email and we will reply with the owner information for
+your list, including passwords and a subset of the current list configuration.
+EOF
+   } elsif ($section eq 'active') {
+      my $listTxt = join "\n",
+                    map { "https://domain/mailman/listinfo/$_" }
+                    sort @$lists;
+      return <<EOF;
+
+----
+
+Here is the list of your active lists:
+
+$listTxt
+
+EOF
+   } elsif ($section eq 'inactive') {
+      my $listTxt = join "\n",
+                    map { my $years = int($inactiveLists->{$_} / 365);
+                          $years = $years == 1 ? "$years year" : "$years years";
+                          my $days = $inactiveLists->{$_} % 365;
+                          $days = $days == 1 ? "$days day" : "$days days";
+                          "$_ (inactive $years, $days)" } sort @$lists;
+      return <<EOF;
+----
+
+Here is the list of your inactive lists (no activity in the last 18 months):
+
+$listTxt
+
+Lists with no activity within the last 18 months will not be migrated, and
+will be unavailable after the migration to Mailman.
+
+If you want to retain one of the lists detailed above, you can either send
+a message to the list (which will update its activity), or send an email
+to email with an explanation as to why this
+inactive list should be migrated and maintained.
+
+----
+
+EOF
+   } elsif ($section eq 'bottom') {
+      return <<EOF;
+We are continuing to develop documentation for Mailman, which you can access
+through the IT Web site. That documentation is still a work in progress;
+the final versions have yet to be published. User and administrator guides for
+Mailman can be found at http://it.uoregon.edu/mailman. We'll provide further
+UO-specific documentation as it becomes available.
+
+It is our intention that this transition proceed smoothly, with a minimum of
+disruption in services for you. Please report any problems or concerns to
+email, and we will address your concerns as quickly as
+possible.
+EOF
+   }
+}
+
 
 # Parse all text configuration files for a Majordomo list and return that
 # info in the %config hash with fields as keys and field values
@@ -349,11 +684,7 @@ sub getListsOverInactivityLimit {
 # listname.closed, listname.private, listname.auto, listname.passwd,
 # listname.strip, and listname.hidden.
 sub getDomoConfig {
-   my ($listName, $listToOwnerMapRef) = @_;
-   if (-e "$DOMO_LIST_DIR/$listName.pendel") {
-      $log->info("List $listName has a .pendel file. Skipping...");
-      return;
-   }
+   my ($listName, $listOwnerMap) = @_;
    my $listPath = "$DOMO_LIST_DIR/$listName";
    # All of these values come from <listname>.config unless a comment
    # says otherwise.
@@ -361,7 +692,7 @@ sub getDomoConfig {
       'admin_passwd'           => '',  # from the list config or passwd files
       'administrivia'          => '',
       'advertise'              => '',
-      'aliases_owner'          => '',  # from the aliases file
+      'aliases_owner'          => $listOwnerMap->{$listName},
       'announcements'          => 'yes',
       'approve_passwd'         => '',
       'description'            => "$listName Mailing List",
@@ -439,7 +770,7 @@ sub getDomoConfig {
          # reference of '@<listname>' instead of adding those emails
          # individually.
          if ($restrictPostFilename !~ /\-digest$/ and
-             exists $listToOwnerMapRef->{$restrictPostFilename}) {
+             exists $listOwnerMap->{$restrictPostFilename}) {
             $log->info("Adding '\@$restrictPostFilename' shortcut list " .
                        "reference to restrict_post_emails...");
             push @postPermissions, "\@$restrictPostFilename";
@@ -456,6 +787,7 @@ sub getDomoConfig {
       # If restrict_post is empty, then anyone can post to it. This can be set
       # in Mailman with a regex that matches everything. Mailman requires
       # regexes in the accept_these_nonmembers field to begin with a caret.
+      # TODO: test this setting!
       $config{'restrict_post_emails'} = "'^.*'";
    }
 
@@ -518,18 +850,6 @@ sub getDomoConfig {
       return;
    }
 
-   #
-   # Sanitize option values
-   #
-   if (exists $listToOwnerMapRef->{$listName} and
-       defined $listToOwnerMapRef->{$listName}) {
-      $config{'aliases_owner'} = $listToOwnerMapRef->{$listName};
-   } else {
-      $log->warning("List $listName has no owner in aliases: Skipping...");
-      $domoStats->{'general_stats'}->{'Lists without owner in aliases'} += 1;
-      return;
-   }
-
    # Munge Majordomo text that references Majordomo-specific commands, etc
    for my $field (qw/info intro message_footer message_fronter
                      message_headers/) {
@@ -549,11 +869,9 @@ sub getDomoConfig {
    return %config;
 }
 
-# Create a hash of Mailman configuration options and values.
+# Create and return a hash of Mailman configuration options and values.
 # The hash is initialized to the most common default values and then modified
 # based on the Majordomo list configuration.
-# @param Majordomo configuration hash
-# @return Mailman configuration hash
 #
 # **** The following Majordomo configuration options are not imported. ****
 # archive_dir - dead option in Majordomo, so safe to ignore.
@@ -574,6 +892,10 @@ sub getDomoConfig {
 # strip - whether to strip everything but the email address. Not in Mailman.
 # taboo_body - message body filtering; roughly used below.  Not in Mailman.
 # which_access - get the lists an email is subscribed to.  Not in Mailman.
+#
+# Additionally, the message_fronter and message_footer of the digest version of
+# the list is not imported because of the difficulty in parsing and translating
+# that text and because Mailman by default includes its own message header.
 sub getMailmanConfig {
    my (%domoConfig) = @_;
    my $listName = $domoConfig{'list_name'};
@@ -587,6 +909,9 @@ sub getMailmanConfig {
       'administrivia'             => 'True',
       'advertised'                => 1,
       'anonymous_list'            => 'False',
+      # NOTE: some may wish to map some Majordomo setting, such as index_access
+      # to Mailman's archive. As is, all archiving is turned off for imported
+      # lists.
       'archive'                   => 'False',  # This doesn't change below
       'archive_private'           =>
          $domoConfig{'index_access'} =~ /open/ ? 0 : 1,
@@ -624,7 +949,7 @@ sub getMailmanConfig {
       'send_welcome_msg'          => $domoConfig{'welcome'} =~ /y/i ? 1 : 0,
       'subject_prefix'            => "'$domoConfig{'subject_prefix'}'",
       'subscribe_policy'          => 3,  # 1: confirm; 3: confirm and approval
-      'unsubscribe_policy'        => 0,  # 0: free to unsub; 1: not free
+      'unsubscribe_policy'        => 0,  # 0: can unsubscribe; 1: can not
       'welcome_msg'               => '',
    );
 
@@ -642,7 +967,7 @@ sub getMailmanConfig {
 
    # Majordomo's "resend_host" => Mailman's "host_name"
    if ($domoConfig{'resend_host'} and not $NEW_HOSTNAME) {
-      $mmConfig{'host_name'} = $domoConfig{'resend_host'};
+      $mmConfig{'host_name'} = "'$domoConfig{'resend_host'}'";
    }
 
    # Majordomo's "message_fronter" => Mailman's "msg_header"
@@ -673,7 +998,7 @@ sub getMailmanConfig {
 
    # Majordomo's "taboo_body" and "taboo_headers" => Mailman's "filter_content"
    #
-   # Note: This is a very rough mapping.  What we're doing here is turning on
+   # NOTE: This is a very rough mapping.  What we're doing here is turning on
    # default content filtering in Mailman if there was *any* header or body
    # filtering in Majordomo.  The regexes in the taboo_* fields in Majordomo are
    # too varied for pattern-parsing.  This blunt method is a paranoid,
@@ -700,7 +1025,7 @@ sub getMailmanConfig {
    # Majordomo's "advertise", "noadvertise", "intro_access", "info_access",
    # and "subscribe_policy" => Mailman's "advertised"
    #
-   # Note: '(no)?advertise' in Majordomo contain regexes, which would be
+   # NOTE: '(no)?advertise' in Majordomo contain regexes, which would be
    # difficult to parse accurately, so just be extra safe here by considering
    # the existence of anything in '(no)?advertise' to mean that the list should
    # be hidden. Also hide the list if intro_access, info_access, or
@@ -725,7 +1050,8 @@ sub getMailmanConfig {
       $mmConfig{'reply_goes_to_list'} = 1;
    } elsif ($domoConfig{'reply_to'} =~ /\s*[^@]+@[^@]+\s*/) {
       $mmConfig{'reply_goes_to_list'} = 2;
-      $mmConfig{'reply_to_address'} = "'" . strip($domoConfig{'reply_to'}) . "'";
+      $mmConfig{'reply_to_address'} = "'" . strip($domoConfig{'reply_to'}) .
+                                      "'";
    }
 
    # Majordomo's "subject_prefix" => Mailman's "subject_prefix"
@@ -761,13 +1087,13 @@ sub createMailmanList {
    $ownerEmail = (split /,/, $ownerEmail)[0];
    $ownerEmail =~ s/['"\[\]]//g;
    my $cmd = "$MM_NEWLIST -l $LANGUAGE -q $listName $ownerEmail " .
-             "'$listPassword'";
+             "'$listPassword' >> $LOG_FILE 2>&1";
    $log->debug("Calling $cmd...");
    system($cmd) == 0 or $log->die("Command failed: $!");
 }
 
 # Create a temporary file that contains a list's configuration values that have
-# been translated from Majordomo.
+# been translated from Majordomo into Mailman's list template format.
 sub createMailmanConfigFile {
    my ($domoApprovePasswd, %mmConfig) = @_;
    my $configFh = File::Temp->new(SUFFIX => ".mm.cfg", UNLINK => 0);
@@ -910,12 +1236,15 @@ sub appendDomoStats {
             $domoStats->{$field}->{'0'} += 1;
             next;
          }
-         $domoStats->{$field}->{'500+'} += 1 if $count >= 500;
+         $domoStats->{$field}->{'2000+'} += 1 if $count >= 2000;
+         $domoStats->{$field}->{'1000-2000'} += 1 if $count >= 1000 and $count < 2000;
+         $domoStats->{$field}->{'500-999'} += 1 if $count >= 500 and $count < 1000;
          $domoStats->{$field}->{'101-500'} += 1 if $count <= 500 and
                                                    $count > 100;
          $domoStats->{$field}->{'26-100'} += 1 if $count <= 100 and $count > 25;
          $domoStats->{$field}->{'6-25'} += 1 if $count <= 25 and $count > 5;
          $domoStats->{$field}->{'1-5'} += 1 if $count < 5;
+         $domoStats->{'general_stats'}->{'Total subscribers'} += $count;
          next;
       } elsif ($field eq 'maxlength') {
          $value = 0 if not $value;
@@ -1001,6 +1330,8 @@ sub help {
       --list=NAME    Import a single list
       --subscribers  Import subscribers in addition to creating the list
       --stats        Print some stats about your Majordomo lists
+      --email-notify Email Majordomo list owners about the upcoming migration
+      --email-test   Email Majordomo list owners with link to test server
       --loglevel     Set STDOUT log level.
                      Possible values: debug, info, notice, warning, error
                      Note: All log entries still get written to the log file.
@@ -1077,6 +1408,10 @@ sub cleanUp {
 # Strip whitespace from the beginning and end of a string.
 sub strip {
    my $string = shift || '';
+   my $args = shift;
    $string =~ s/(^\s*|\s*$)//g;
+   if (exists $args->{'full'}) {
+      $string =~ s/(^['"]+|['"]+$)//g;
+   }
    return $string;
 }
